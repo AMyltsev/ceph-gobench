@@ -14,7 +14,7 @@ type params struct {
 	bs, os, cluster, user, keyring, config, pool, define, cpuprofile, memprofile string
 }
 
-type cephConnection struct {
+type cephconnection struct {
 	conn  *rados.Conn
 	ioctx *rados.IOContext
 }

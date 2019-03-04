@@ -17,7 +17,7 @@ import (
 	"github.com/fatih/color"
 )
 
-func bench(cephconn *cephConnection, osddevice device, buff *[]byte, startbuff *[]byte, params *params,
+func bench(cephconn *cephconnection, osddevice Device, buff *[]byte, startbuff *[]byte, params *params,
 	wg *sync.WaitGroup, result chan string) {
 	defer wg.Done()
 	threadresult := make(chan []time.Duration, params.threadsCount)
@@ -42,7 +42,7 @@ func bench(cephconn *cephConnection, osddevice device, buff *[]byte, startbuff *
 		}
 	}
 	for i := 0; i < int(params.threadsCount); i++ {
-		go benchThread(cephconn, osddevice, params, buff, threadresult, objectnames[i*16:i*16+16])
+		go benchthread(cephconn, osddevice, params, buff, threadresult, objectnames[i*16:i*16+16])
 	}
 	for i := uint64(0); i < params.threadsCount; i++ {
 		for _, lat := range <-threadresult {
@@ -175,7 +175,7 @@ func bench(cephconn *cephConnection, osddevice device, buff *[]byte, startbuff *
 	result <- buffer.String()
 }
 
-func benchThread(cephconn *cephConnection, osddevice device, params *params, buff *[]byte,
+func benchthread(cephconn *cephconnection, osddevice Device, params *params, buff *[]byte,
 	result chan []time.Duration, objnames []string) {
 	var latencies []time.Duration
 	starttime := time.Now()
