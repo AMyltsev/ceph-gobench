@@ -18,29 +18,25 @@ import (
 )
 
 func bench(cephconn *cephconnection, osddevice Device, buff *[]byte, startbuff *[]byte, params *params,
-	wg *sync.WaitGroup, result chan string) {
+	wg *sync.WaitGroup, result chan string, totalLats chan avgLatencies, objectnames []string) {
 	defer wg.Done()
 	threadresult := make(chan []time.Duration, params.threadsCount)
-	var objectnames []string
 	var osdlatencies []time.Duration
 	defer func() {
 		for _, object := range objectnames {
 			cephconn.ioctx.Delete(object)
 		}
 	}()
-	// calculate object for each thread
-	for suffix := 0; len(objectnames) < int(params.threadsCount)*16; suffix++ {
-		name := "bench_" + strconv.Itoa(suffix)
-		if osddevice.ID == getObjActingPrimary(cephconn, *params, name) {
-			objectnames = append(objectnames, name)
-			if err := cephconn.ioctx.WriteFull(name, *startbuff); err != nil {
-				log.Printf("Can't write object: %v, osd: %v", name, osddevice.Name)
-			}
-			if err := cephconn.ioctx.Truncate(name, uint64(params.objectsize)); err != nil {
-				log.Printf("Can't truncate object: %v, osd: %v", name, osddevice.Name)
-			}
+	// Create and truncate each object
+	for _, object := range objectnames {
+		if err := cephconn.ioctx.WriteFull(object, *startbuff); err != nil {
+			log.Printf("Can't write object: %v, osd: %v", object, osddevice.Name)
+		}
+		if err := cephconn.ioctx.Truncate(object, uint64(params.objectsize)); err != nil {
+			log.Printf("Can't truncate object: %v, osd: %v", object, osddevice.Name)
 		}
 	}
+
 	for i := 0; i < int(params.threadsCount); i++ {
 		go benchthread(cephconn, osddevice, params, buff, threadresult, objectnames[i*16:i*16+16])
 	}
@@ -122,11 +118,13 @@ func bench(cephconn *cephconnection, osddevice Device, buff *[]byte, startbuff *
 	}
 	buffer.WriteString("\n\n")
 
+	totalLats <- avgLatencies{latencytotal: latencytotal, len: int64(len(osdlatencies))}
+
 	latencytotal = latencytotal / int64(len(osdlatencies))
 	// iops = 1s / latency
 	iops := 1000000 / latencytotal * int64(params.threadsCount)
 	// avg speed = iops * block size / 1 MB
-	avgspeed := 1000000 / float64(latencytotal) * float64(params.blocksize) / 1024 / 1024 * float64(params.threadsCount)
+	avgspeed := float64(iops) * float64(params.blocksize) / 1024 / 1024
 	avgline := fmt.Sprintf("Avg iops: %-5v    Avg speed: %.3f MB/s    Total writes count: %-5v    Total writes (MB): %-5v\n\n",
 		iops, avgspeed, len(osdlatencies), uint64(len(osdlatencies))*params.blocksize/1024/1024)
 	switch {
@@ -236,12 +234,43 @@ func main() {
 
 	var wg sync.WaitGroup
 	results := make(chan string, len(osddevices)*int(params.threadsCount))
+	totalLats := make(chan avgLatencies, len(osddevices))
+	avgLats := []avgLatencies{}
+
+	log.Println("Calculating objects")
+	objectnames := map[int64][]string{}
+	// calculate object for each thread
+	for suffix := 0; ; suffix++ {
+		name := "bench_" + strconv.Itoa(suffix)
+		osdid := getObjActingPrimary(cephconn, params, name)
+
+		objectsdone := 0
+		for _, osddevice := range osddevices {
+			if osddevice.ID == osdid {
+				if len(objectnames[osdid]) < int(params.threadsCount)*16 {
+					objectnames[osdid] = append(objectnames[osdid], name)
+				} else {
+
+				}
+			}
+			if len(objectnames[osddevice.ID]) >= int(params.threadsCount)*16 {
+				objectsdone++
+			}
+		}
+		if objectsdone >= len(osddevices) {
+			break
+		}
+	}
+
+	log.Println("Benchmark started")
+
 	for _, osd := range osddevices {
 		wg.Add(1)
 		if params.parallel == true {
-			go bench(cephconn, osd, &buff, &startbuff, &params, &wg, results)
+			go bench(cephconn, osd, &buff, &startbuff, &params, &wg, results, totalLats, objectnames[osd.ID])
 		} else {
-			bench(cephconn, osd, &buff, &startbuff, &params, &wg, results)
+			bench(cephconn, osd, &buff, &startbuff, &params, &wg, results, totalLats, objectnames[osd.ID])
+			avgLats = append(avgLats, <-totalLats)
 			log.Println(<-results)
 		}
 
@@ -251,12 +280,38 @@ func main() {
 		go func() {
 			wg.Wait()
 			close(results)
+			close(totalLats)
 		}()
 
 		for message := range results {
 			log.Println(message)
-
+		}
+		for lat := range totalLats {
+			avgLats = append(avgLats, lat)
 		}
 	}
 
+	sumLat := int64(0)
+	countLat := int64(0)
+	for _, avgLat := range avgLats {
+		sumLat += avgLat.latencytotal
+		countLat += avgLat.len
+	}
+
+	//count avg statistics
+	sumLat = sumLat / int64(countLat)
+	avgIops := 1000000 / sumLat * int64(params.threadsCount)
+	sumIops := 1000000 / sumLat * int64(params.threadsCount) * int64(len(osddevices))
+	avgSpeed := float64(avgIops) * float64(params.blocksize) / 1024 / 1024
+	sumSpeed := float64(sumIops) * float64(params.blocksize) / 1024 / 1024
+
+	color.Set(color.FgHiYellow)
+	defer color.Unset()
+
+	fmt.Printf("Summary avg iops per osd:%5d    Summary avg speed per osd: %.3f MB/s\n"+
+		"Total writes count:%11d    Total writes (MB): %v\n",
+		avgIops, avgSpeed, countLat, uint64(countLat)*params.blocksize/1024/1024)
+	if params.parallel {
+		fmt.Printf("Summary avg iops:%13d    Summary avg speed: %.3f MB/s\n", sumIops, sumSpeed)
+	}
 }
